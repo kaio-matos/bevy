@@ -43,6 +43,7 @@ use bevy_render::erased_render_asset::{
 };
 use bevy_render::render_asset::{prepare_assets, RenderAssets};
 use bevy_render::renderer::RenderQueue;
+use bevy_render::GpuResourceAppExt;
 use bevy_render::RenderStartup;
 use bevy_render::{
     batching::gpu_preprocessing::GpuPreprocessingSupport,
@@ -288,25 +289,25 @@ impl Plugin for MaterialsPlugin {
         app.add_plugins((PrepassPipelinePlugin, PrepassPlugin::new(self.debug_flags)));
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
-                .init_resource::<SpecializedMaterialPipelineCache>()
-                .init_resource::<SpecializedMeshPipelines<MaterialPipelineSpecializer>>()
-                .init_resource::<LightKeyCache>()
-                .init_resource::<SpecializedShadowMaterialPipelineCache>()
+                .init_gpu_resource::<SpecializedMaterialPipelineCache>()
+                .init_gpu_resource::<SpecializedMeshPipelines<MaterialPipelineSpecializer>>()
+                .init_gpu_resource::<LightKeyCache>()
+                .init_gpu_resource::<SpecializedShadowMaterialPipelineCache>()
                 .init_resource::<DrawFunctions<Shadow>>()
                 .init_resource::<RenderMaterialInstances>()
                 .allow_ambiguous_resource::<RenderMaterialInstances>()
                 .init_resource::<MaterialBindGroupAllocators>()
                 .allow_ambiguous_resource::<MaterialBindGroupAllocators>()
-                .init_resource::<PendingMeshMaterialQueues>()
+                .init_gpu_resource::<PendingMeshMaterialQueues>()
                 .allow_ambiguous_resource::<PendingMeshMaterialQueues>()
-                .init_resource::<PendingShadowQueues>()
+                .init_gpu_resource::<PendingShadowQueues>()
                 .allow_ambiguous_resource::<PendingShadowQueues>()
                 .add_render_command::<Shadow, DrawPrepass>()
                 .add_render_command::<Shadow, DrawDepthOnlyPrepass>()
                 .add_render_command::<Transparent3d, DrawMaterial>()
                 .add_render_command::<Opaque3d, DrawMaterial>()
                 .add_render_command::<AlphaMask3d, DrawMaterial>()
-                .add_systems(RenderStartup, init_material_pipeline)
+                .add_systems(RenderStartup, init_material_pipeline.after(MeshPipelineSet))
                 .add_systems(
                     Render,
                     (
@@ -654,9 +655,9 @@ fn mark_meshes_as_changed_if_their_materials_changed<M>(
 ) where
     M: Material,
 {
-    for mut mesh in &mut changed_meshes_query {
+    changed_meshes_query.par_iter_mut().for_each(|mut mesh| {
         mesh.set_changed();
-    }
+    });
 }
 
 /// Fills the [`RenderMaterialInstances`] resources from the meshes in the
@@ -929,7 +930,7 @@ pub(crate) fn specialize_material_meshes(
             mut specialized_material_pipeline_cache,
             mut pending_mesh_material_queues,
             dirty_specializations,
-        } = state.get_mut(world);
+        } = state.get_mut(world).unwrap();
 
         for (view, visible_entities) in &views {
             all_views.insert(view.retained_view_entity);
@@ -1010,7 +1011,7 @@ pub(crate) fn specialize_material_meshes(
                         .insert((*render_entity, *visible_entity));
                     continue;
                 };
-                let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id) else {
+                let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id()) else {
                     continue;
                 };
                 let Some(material) = render_materials.get(material_instance.asset_id) else {
@@ -1049,13 +1050,13 @@ pub(crate) fn specialize_material_meshes(
 
                 if view_key.contains(MeshPipelineKey::MOTION_VECTOR_PREPASS) {
                     if mesh_instance
-                        .flags
+                        .flags()
                         .contains(RenderMeshInstanceFlags::HAS_PREVIOUS_SKIN)
                     {
                         mesh_key |= MeshPipelineKey::HAS_PREVIOUS_SKIN;
                     }
                     if mesh_instance
-                        .flags
+                        .flags()
                         .contains(RenderMeshInstanceFlags::HAS_PREVIOUS_MORPH)
                     {
                         mesh_key |= MeshPipelineKey::HAS_PREVIOUS_MORPH;
@@ -1208,7 +1209,9 @@ pub fn queue_material_meshes(
             };
 
             // Fetch the slabs that this mesh resides in.
-            let (vertex_slab, index_slab) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id);
+            let Some(mesh_slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
+                continue;
+            };
 
             match material.properties.render_phase_type {
                 RenderPhaseType::Transmissive => {
@@ -1228,7 +1231,7 @@ pub fn queue_material_meshes(
                         pipeline: pipeline_id,
                         batch_range: 0..1,
                         extra_index: PhaseItemExtraIndex::None,
-                        indexed: index_slab.is_some(),
+                        indexed: mesh_slabs.index_slab_id.is_some(),
                         // Filled in later.
                         distance: 0.0,
                     });
@@ -1252,12 +1255,14 @@ pub fn queue_material_meshes(
                         pipeline: pipeline_id,
                         draw_function,
                         material_bind_group_index: Some(material.binding.group.0),
-                        vertex_slab: vertex_slab.unwrap_or_default(),
-                        index_slab,
-                        lightmap_slab: mesh_instance.shared.lightmap_slab_index.map(|index| *index),
+                        slabs: mesh_slabs,
+                        lightmap_slab: mesh_instance
+                            .shared
+                            .lightmap_slab_index()
+                            .map(|index| *index),
                     };
                     let bin_key = Opaque3dBinKey {
-                        asset_id: mesh_instance.mesh_asset_id.into(),
+                        asset_id: mesh_instance.mesh_asset_id().into(),
                     };
                     opaque_phase.add(
                         batch_set_key,
@@ -1282,11 +1287,10 @@ pub fn queue_material_meshes(
                         draw_function,
                         pipeline: pipeline_id,
                         material_bind_group_index: Some(material.binding.group.0),
-                        vertex_slab: vertex_slab.unwrap_or_default(),
-                        index_slab,
+                        slabs: mesh_slabs,
                     };
                     let bin_key = OpaqueNoLightmap3dBinKey {
-                        asset_id: mesh_instance.mesh_asset_id.into(),
+                        asset_id: mesh_instance.mesh_asset_id().into(),
                     };
                     alpha_mask_phase.add(
                         batch_set_key,
@@ -1316,7 +1320,7 @@ pub fn queue_material_meshes(
                         pipeline: pipeline_id,
                         batch_range: 0..1,
                         extra_index: PhaseItemExtraIndex::None,
-                        indexed: index_slab.is_some(),
+                        indexed: mesh_slabs.index_slab_id.is_some(),
                         // Filled in later.
                         distance: 0.0,
                     });
